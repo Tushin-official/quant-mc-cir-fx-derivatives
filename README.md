@@ -1,1 +1,1 @@
-Check tets.ipynb
+Check tets_en.ipynb
