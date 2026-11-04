@@ -1,5 +1,10 @@
 import numpy as np
 import pandas as pd
+import warnings
+if __package__:
+    from .simulation import CIRParams, simulate_paths
+else:
+    from simulation import CIRParams, simulate_paths
 from sklearn.linear_model import LinearRegression
 
 
@@ -18,8 +23,13 @@ class Preprocess:
         corr_start,
         dt,
         n_sims,
-        horizon_years
+        horizon_years,
+        seed=None
     ):
+        self.rng = np.random.default_rng(seed)
+        self.seed = seed
+        if not np.isfinite(dt) or dt <= 0:
+            raise ValueError("dt must be positive and finite")
         self.ruonia_path = ruonia_path
         self.sofr_path = sofr_path
         self.fx_path = fx_path
@@ -126,7 +136,7 @@ class Preprocess:
     # БРОУНОВСКОЕ ДВИЖЕНИЕ
 
     def brownian_motion(self, T):
-        return np.random.normal(0.0, 1.0, T)
+        return self.rng.normal(0.0, 1.0, T)
 
     # CIR: ГЕНЕРАЦИЯ
 
@@ -140,13 +150,15 @@ class Preprocess:
 
         r_t = np.empty(T + 1)
         r_t[0] = r_0
+        latent = float(r_0)
         for t in range(1, T + 1):
-            rt_prev = max(r_t[t - 1], 0.0)  #чтобы не было отрицательных
+            rt_prev = max(latent, 0.0)  #чтобы не было отрицательных
             dr_t = (
                 kappa * (theta - rt_prev) * dt
                 + sigma * np.sqrt(max(rt_prev, 0.0)) * np.sqrt(dt) * dW[t - 1]
             )
-            r_t[t] = rt_prev + dr_t
+            latent += dr_t
+            r_t[t] = max(latent, 0.0)
 
         return r_t
 
@@ -155,6 +167,10 @@ class Preprocess:
     def _calibrate_cir(self, r_series, n_bootstrap=500):
         r = r_series.dropna().astype(float).values
 
+        if len(r) < 4 or not np.isfinite(r).all() or np.any(r <= 0):
+            raise ValueError("Historical CIR OLS requires >=4 strictly positive finite observations")
+        if n_bootstrap < 2:
+            raise ValueError("n_bootstrap must be >=2")
         r_0 = r[0]
 
         dt = self.dt
@@ -184,6 +200,8 @@ class Preprocess:
             # beta1 = kappa*theta*dt
             # beta2 = -kappa*dt
             kappa_dt = -beta2
+            if kappa_dt <= 0 or beta1 < 0:
+                raise ValueError("Unconstrained OLS produced inadmissible CIR parameters")
             theta = beta1 / kappa_dt
 
             kappa = kappa_dt / dt
@@ -251,8 +269,7 @@ class Preprocess:
 
         for t in range(1, T + 1):
             s_prev = s_t[t - 1]
-            ds_t = mu * s_prev * dt + sigma * s_prev * np.sqrt(dt) * dW[t - 1]
-            s_t[t] = s_prev + ds_t
+            s_t[t] = s_prev * np.exp((mu - 0.5*sigma**2)*dt + sigma*np.sqrt(dt)*dW[t-1])
 
         return s_t
 
@@ -260,7 +277,10 @@ class Preprocess:
 
     def _calibrate_fx(self, S_series, n_bootstrap=500):
         s = S_series.dropna().astype(float)
-        s = s[s > 0]
+        if len(s) < 4 or not np.isfinite(s).all() or (s <= 0).any():
+            raise ValueError("FX estimation requires >=4 positive finite observations")
+        if n_bootstrap < 2:
+            raise ValueError("n_bootstrap must be >=2")
 
         s_0 = float(s.iloc[0])
         dt = self.dt
@@ -328,120 +348,24 @@ class Preprocess:
 
     
     def simulate(self):
-        """
-        Совместная симуляция траекторий r_RUB(t), r_USD(t), S(t) на горизонте horizon_years
-        с шагом dt и учётом корреляционной матрицы.
-        """
-
-        # 1. Размерности и сетка времени
-        dt = self.dt
-        n_sims = self.n_sims
-        horizon = self.horizon_years
-
-        n_steps = int(horizon / dt)
-        t_grid = np.linspace(0.0, horizon, n_steps + 1)
-
-        # 2. Достаём параметры моделей
-
-        # CIR RUB: берём историческую оценку (OLS)
-        cir_rub = self.params["cir_rub"]
-        kappa_rub = float(cir_rub["kappa"][0])
-        theta_rub = float(cir_rub["theta"][0])
-        sigma_rub = float(cir_rub["sigma"][0])
-
-        # CIR USD: берём историческую оценку (OLS)
-        cir_usd = self.params["cir_usd"]
-        kappa_usd = float(cir_usd["kappa"][0])
-        theta_usd = float(cir_usd["theta"][0])
-        sigma_usd = float(cir_usd["sigma"][0])
-
-        # FX: берём sigma из калибровки, mu = r_RUB - r_USD
-        fx_params = self.params["fx"]
-        sigma_fx = float(fx_params["sigma"][0])
-
-        # корреляционная матрица 3x3
-        corr = self.params["corr_matrix"]
-        L = np.linalg.cholesky(corr)  # LL^T = corr
-
-        # 3. Инициализация массивов траекторий
-
-        r_rub_paths = np.empty((n_sims, n_steps + 1))
-        r_usd_paths = np.empty((n_sims, n_steps + 1))
-        S_paths = np.empty((n_sims, n_steps + 1))
-
-        r_rub_0 = self.start_values["r_rub_0"]
-        r_usd_0 = self.start_values["r_usd_0"]
-        S_0 = self.start_values["S_0"]
-
-        r_rub_paths[:, 0] = r_rub_0
-        r_usd_paths[:, 0] = r_usd_0
-        S_paths[:, 0] = S_0
-
-        # 4. Основной цикл по времени
-
-        for t_idx in range(n_steps):
-            # независимые N(0,1)
-            Z = np.random.normal(size=(n_sims, 3))
-            # коррелированные шоки с корреляцией corr
-            eps = Z @ L.T
-
-            eps_rub = eps[:, 0]
-            eps_usd = eps[:, 1]
-            eps_fx  = eps[:, 2]
-
-            r_rub_prev = r_rub_paths[:, t_idx]
-            r_usd_prev = r_usd_paths[:, t_idx]
-            S_prev     = S_paths[:, t_idx]
-
-            # обновление RUB CIR
-            r_rub_prev_clipped = np.clip(r_rub_prev, 1e-8, None)
-            sqrt_rub = np.sqrt(r_rub_prev_clipped)
-
-            dr_rub = (
-                kappa_rub * (theta_rub - r_rub_prev) * dt
-                + sigma_rub * sqrt_rub * np.sqrt(dt) * eps_rub
-            )
-            r_rub_new = r_rub_prev + dr_rub
-            r_rub_new = np.clip(r_rub_new, 0.0, None)
-
-            # обновление USD CIR
-            r_usd_prev_clipped = np.clip(r_usd_prev, 1e-8, None)
-            sqrt_usd = np.sqrt(r_usd_prev_clipped)
-
-            dr_usd = (
-                kappa_usd * (theta_usd - r_usd_prev) * dt
-                + sigma_usd * sqrt_usd * np.sqrt(dt) * eps_usd
-            )
-            r_usd_new = r_usd_prev + dr_usd
-            r_usd_new = np.clip(r_usd_new, 0.0, None)
-
-            # риск-нейтральный дрейф FX
-            # mu^Q_t = r_rub_t - r_usd_t (по траекториям на текущем шаге)
-            mu_q = r_rub_prev - r_usd_prev
-
-            dS = S_prev * (mu_q * dt + sigma_fx * np.sqrt(dt) * eps_fx)
-            S_new = S_prev + dS
-            S_new = np.clip(S_new, 1e-8, None)
-
-            # запись нового шага
-            r_rub_paths[:, t_idx + 1] = r_rub_new
-            r_usd_paths[:, t_idx + 1] = r_usd_new
-            S_paths[:, t_idx + 1]     = S_new
-
-        # 5. Сохранение результатов
-        self.simulation["t_grid"] = t_grid
-        self.simulation["r_rub_paths"] = r_rub_paths
-        self.simulation["r_usd_paths"] = r_usd_paths
-        self.simulation["S_paths"] = S_paths
-
+        """Legacy historical-parameter sensitivity scenario, not market calibration."""
+        warnings.warn("Historical OLS parameters are a proxy, not risk-neutral calibration",
+                      UserWarning, stacklevel=2)
+        def cir(key):
+            p = self.params[key]
+            return CIRParams(*(float(p[k][0]) for k in ("kappa", "theta", "sigma")))
+        self.simulation = simulate_paths(
+            domestic=cir("cir_rub"), foreign=cir("cir_usd"),
+            sigma_fx=float(self.params["fx"]["sigma"][0]),
+            corr=self.params["corr_matrix"],
+            r_domestic_0=self.start_values["r_rub_0"],
+            r_foreign_0=self.start_values["r_usd_0"],
+            spot=self.start_values["S_0"], horizon=self.horizon_years,
+            dt=self.dt, n_sims=self.n_sims, seed=self.seed,
+            parameter_basis="historical_proxy")
 
     def get_simulation_result(self):
-        return {
-            "t_grid": self.simulation["t_grid"],
-            "S_paths": self.simulation["S_paths"],
-            "r_rub_paths": self.simulation["r_rub_paths"],
-            "r_usd_paths": self.simulation["r_usd_paths"],
-            "params": self.params,
-            "start_values": self.start_values,
-            "dt": self.dt,
-        }
+        if not self.simulation:
+            raise ValueError("Call simulate() first")
+        return {**self.simulation, "params": self.params,
+                "start_values": self.start_values}
